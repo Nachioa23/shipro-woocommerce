@@ -94,23 +94,243 @@ class Shipro_WC_Shipping_Method extends WC_Shipping_Method {
 	}
 
 	/**
-	 * Cotización.
+	 * Cotización — llama a POST {base}/cotizar del backend Shipro con la API Key
+	 * del merchant y mapea cada OpcionTarifa devuelta en una tarifa WooCommerce.
 	 *
-	 * @param array $package Info del carrito del comprador (destino, items, etc.).
+	 * Diseño defensivo — la venta NUNCA se cae por esta pieza:
+	 * - Sin API Key configurada → 0 tarifas, sin fatal.
+	 * - Sin CP destino → 0 tarifas, sin fatal.
+	 * - Timeout / conexión rota (Camino 1 del contrato: 5s hard) → 0 tarifas, sin fatal.
+	 * - HTTP != 200 / body malformado → 0 tarifas, sin fatal.
+	 * - Cualquier Throwable en el parseo → 0 tarifas, sin fatal (catch \Throwable abajo).
+	 *
+	 * NO inventamos peso/dimensiones (regla del contrato: peso/dims faltantes son
+	 * responsabilidad del server; el plugin sólo transmite lo que el WC_Product tiene).
+	 * NO enviamos ningún campo de seguro / valorDeclarado — insurance es 100% server-side.
+	 *
+	 * @param array $package Info del carrito del comprador (destino, items, contents_cost, etc.).
 	 * @return void
 	 */
 	public function calculate_shipping( $package = array() ) {
-		// STEP 2B will replace this placeholder with a real call to Shipro POST /cotizar
-		// — con peso + dims + CP origen (del depósito/settings) + CP destino + items del carrito.
-		// El response se va a mapear en N tarifas add_rate() reales (una por courier + servicio).
-		$this->add_rate(
+		try {
+			$this->cotizar_y_emitir_tarifas( $package );
+		} catch ( \Throwable $e ) {
+			// Última red: cualquier excepción no capturada dentro de la cotización cae acá
+			// para que el checkout siga funcionando (otros métodos, o el mensaje "no hay opciones").
+			$this->debug_log( 'Shipro /cotizar unexpected exception: ' . $e->getMessage() );
+		}
+	}
+
+	/**
+	 * Orquesta el llamado real. Separado para poder wraparlo con try/catch limpio.
+	 *
+	 * @param array $package Package del carrito.
+	 * @return void
+	 */
+	private function cotizar_y_emitir_tarifas( array $package ) {
+		// 1) API Key — sin esto no hay a quién autenticarse. Salida silenciosa; el merchant
+		//    verá que el método existe (WC lo lista en la zona) pero no emite tarifas hasta configurarla.
+		$api_key = shipro_wc_get_api_key();
+		if ( '' === $api_key ) {
+			$this->debug_log( 'Shipro: API Key no configurada — no se emiten tarifas.' );
+			return;
+		}
+
+		// 2) Destino. El server necesita al menos el CP. Si el carrito no lo tiene todavía
+		//    (etapa temprana del checkout), salimos sin fatal — WC va a re-calcular cuando el
+		//    comprador complete el address form.
+		$destination = isset( $package['destination'] ) && is_array( $package['destination'] ) ? $package['destination'] : array();
+		$cp_destino  = isset( $destination['postcode'] ) ? sanitize_text_field( (string) $destination['postcode'] ) : '';
+		if ( '' === $cp_destino ) {
+			return;
+		}
+		$provincia_destino = isset( $destination['state'] ) ? sanitize_text_field( (string) $destination['state'] ) : '';
+
+		// 3) Construir paquetes[]. Convención: UN paquete por line-item del carrito.
+		//    Peso × cantidad (line total); dims per-unit (multiplicar dims no tiene sentido físico,
+		//    el server hace su propio empaquetado). Producto sin weight/dims → OMITIMOS esas keys
+		//    (no inventamos 10×10×10 ni 1kg — la política de datos faltantes es server-side).
+		$paquetes = array();
+		$contents = isset( $package['contents'] ) && is_array( $package['contents'] ) ? $package['contents'] : array();
+		foreach ( $contents as $item ) {
+			$product = isset( $item['data'] ) && is_object( $item['data'] ) ? $item['data'] : null;
+			if ( ! $product || ! method_exists( $product, 'get_weight' ) ) {
+				continue;
+			}
+			$qty        = isset( $item['quantity'] ) ? max( 1, (int) $item['quantity'] ) : 1;
+			$peso_unit  = (float) $product->get_weight();
+			$largo_unit = method_exists( $product, 'get_length' ) ? (float) $product->get_length() : 0.0;
+			$ancho_unit = method_exists( $product, 'get_width' ) ? (float) $product->get_width() : 0.0;
+			$alto_unit  = method_exists( $product, 'get_height' ) ? (float) $product->get_height() : 0.0;
+
+			$paquete = array();
+			if ( $peso_unit > 0 ) {
+				$paquete['pesoKg'] = $peso_unit * $qty;
+			}
+			if ( $largo_unit > 0 ) {
+				$paquete['largoCm'] = $largo_unit;
+			}
+			if ( $ancho_unit > 0 ) {
+				$paquete['anchoCm'] = $ancho_unit;
+			}
+			if ( $alto_unit > 0 ) {
+				$paquete['altoCm'] = $alto_unit;
+			}
+			if ( method_exists( $product, 'get_name' ) ) {
+				$paquete['contenido'] = sanitize_text_field( (string) $product->get_name() );
+			}
+			$paquetes[] = $paquete;
+		}
+
+		if ( empty( $paquetes ) ) {
+			// Carrito vacío o sin productos válidos — WC ya no debería llamar acá, pero defensivo.
+			return;
+		}
+
+		// 4) valorCarrito — sub-total del package (ya calculado por WC en contents_cost).
+		$valor_carrito = isset( $package['contents_cost'] ) ? (float) $package['contents_cost'] : 0.0;
+
+		// 5) Body de la request.
+		$request = array(
+			'cpDestino' => $cp_destino,
+			'paquetes'  => $paquetes,
+		);
+		if ( '' !== $provincia_destino ) {
+			$request['provinciaDestino'] = $provincia_destino;
+		}
+		if ( $valor_carrito > 0 ) {
+			$request['valorCarrito'] = $valor_carrito;
+		}
+
+		// 6) Endpoint — base URL filterable para poder apuntar a staging desde código.
+		$api_base = apply_filters( 'shipro_wc_api_base', 'https://api.shipro.pro/v1' );
+		$endpoint = trailingslashit( (string) $api_base ) . 'cotizar';
+
+		// 7) Fire. Timeout 5s = ventana dura del checkout (contrato DEUDA 129 / Camino 1).
+		$response = wp_remote_post(
+			$endpoint,
 			array(
-				'id'       => $this->id . ':placeholder',
-				'label'    => esc_html__( 'Shipro (placeholder)', 'shipro-woocommerce' ),
-				'cost'     => 9999,
-				'calc_tax' => 'per_order',
-				'package'  => $package,
+				'timeout'  => 5,
+				'blocking' => true,
+				'headers'  => array(
+					// La API Key NO debe aparecer en ningún log ni error message — sólo en el header.
+					'Authorization' => 'Bearer ' . $api_key,
+					'Content-Type'  => 'application/json',
+					'Accept'        => 'application/json',
+				),
+				'body'     => wp_json_encode( $request ),
 			)
 		);
+
+		// 8) Timeout / conexión rota → no publicamos nada. Camino 1: mejor no mostrar Shipro
+		//    que hacer esperar al comprador y perder el checkout.
+		if ( is_wp_error( $response ) ) {
+			$this->debug_log( 'Shipro /cotizar wp_error: ' . $response->get_error_message() );
+			return;
+		}
+
+		$status = (int) wp_remote_retrieve_response_code( $response );
+		$body   = (string) wp_remote_retrieve_body( $response );
+
+		if ( 200 !== $status ) {
+			// Loggear body PODA-do para debug; NO logueamos headers (donde vive la API Key).
+			$snippet = function_exists( 'mb_substr' ) ? mb_substr( $body, 0, 500 ) : substr( $body, 0, 500 );
+			$this->debug_log( 'Shipro /cotizar HTTP ' . $status . ' — body: ' . $snippet );
+			return;
+		}
+
+		// 9) Parse. Un JSON malformado no debe explotar el checkout.
+		$data = json_decode( $body, true );
+		if ( ! is_array( $data ) ) {
+			$this->debug_log( 'Shipro /cotizar body no es JSON válido.' );
+			return;
+		}
+
+		if ( ! empty( $data['coberturaVacia'] ) ) {
+			// El server dijo "no hay cobertura" — no mostramos Shipro pero tampoco error.
+			return;
+		}
+
+		// 10) Emitir las tarifas EN EL ORDEN devuelto por el server (ya viene ranked por la
+		//     regla de ruteo del merchant). Domicilio primero, luego sucursal.
+		$grupos = array();
+		if ( isset( $data['domicilio'] ) && is_array( $data['domicilio'] ) ) {
+			$grupos[] = $data['domicilio'];
+		}
+		if ( isset( $data['sucursal'] ) && is_array( $data['sucursal'] ) ) {
+			$grupos[] = $data['sucursal'];
+		}
+
+		foreach ( $grupos as $tarifas ) {
+			foreach ( $tarifas as $opcion ) {
+				if ( ! is_array( $opcion ) ) {
+					continue;
+				}
+
+				// precioFinal viene como DECIMAL STRING ("12345.67"). Defensivo: normalizamos
+				// coma → punto (por si algún day el server lo AR-formatea) y validamos que sea
+				// numérico antes de cast a float. Tolerancia: para plata >~$10M el float pierde
+				// precisión — no aplica en tarifas de courier AR, así que float es OK acá.
+				$precio_str = isset( $opcion['precioFinal'] ) ? (string) $opcion['precioFinal'] : '';
+				$precio_str = str_replace( ',', '.', $precio_str );
+				if ( '' === $precio_str || ! is_numeric( $precio_str ) ) {
+					continue;
+				}
+				$precio = (float) $precio_str;
+				if ( $precio < 0 ) {
+					continue;
+				}
+
+				$codigo_servicio = isset( $opcion['codigoServicio'] ) ? sanitize_key( (string) $opcion['codigoServicio'] ) : '';
+				$courier         = isset( $opcion['courier'] ) ? (string) $opcion['courier'] : '';
+				$modalidad       = isset( $opcion['modalidad'] ) ? (string) $opcion['modalidad'] : '';
+				$label           = trim( $courier . ( '' !== $modalidad ? ' - ' . $modalidad : '' ) );
+				if ( '' === $label ) {
+					$label = esc_html__( 'Shipro', 'shipro-woocommerce' );
+				}
+
+				// Rate id determinístico — permite que WC dedupe y que el comprador conserve la
+				// elección entre re-cálculos del carrito. Prefiere codigoServicio del server;
+				// si no viene, cae a un slug del courier+modalidad, y por último a un hash.
+				$rate_id_suffix = '' !== $codigo_servicio
+					? $codigo_servicio
+					: sanitize_key( strtolower( $courier . '-' . $modalidad ) );
+				if ( '' === $rate_id_suffix ) {
+					$rate_id_suffix = 'opt-' . md5( (string) ( $opcion['id'] ?? $label ) );
+				}
+
+				$this->add_rate(
+					array(
+						'id'        => $this->id . ':' . $rate_id_suffix,
+						'label'     => wp_strip_all_tags( $label ),
+						'cost'      => $precio,
+						'calc_tax'  => 'per_order',
+						'package'   => $package,
+						// STEP 2C (polish) va a leer fechaEstimada de acá y mostrarla en el checkout
+						// bajo el label. Por ahora sólo la CARGAMOS con la tarifa para no perderla.
+						'meta_data' => array(
+							'fechaEstimada'  => isset( $opcion['fechaEstimadaString'] ) ? (string) $opcion['fechaEstimadaString'] : '',
+							'esFallback'     => ! empty( $opcion['esFallback'] ),
+							'codigoServicio' => $codigo_servicio,
+							'etiquetaSla'    => isset( $opcion['etiquetaSla'] ) ? (string) $opcion['etiquetaSla'] : '',
+							'slaHs'          => isset( $opcion['slaHs'] ) ? (int) $opcion['slaHs'] : 0,
+						),
+					)
+				);
+			}
+		}
+	}
+
+	/**
+	 * Debug log helper — usa WC logger si está, no-op si no.
+	 * IMPORTANTE: nunca pasar por acá la API Key ni el header Authorization.
+	 *
+	 * @param string $message Texto a loggear.
+	 * @return void
+	 */
+	private function debug_log( $message ) {
+		if ( function_exists( 'wc_get_logger' ) ) {
+			wc_get_logger()->debug( $message, array( 'source' => 'shipro-wc' ) );
+		}
 	}
 }
