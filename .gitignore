@@ -1,0 +1,19 @@
+# macOS
+.DS_Store
+
+# Editor / IDE cruft
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Build artefacts (el .zip para subir a wp-admin no vive versionado)
+*.zip
+
+# Composer / npm (por si algún día se suman; hoy no aplican)
+vendor/
+node_modules/
+
+# Logs y bases locales
+*.log
