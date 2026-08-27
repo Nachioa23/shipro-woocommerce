@@ -11,6 +11,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 require_once SHIPRO_WC_PLUGIN_DIR . 'includes/class-shipro-wc-settings.php';
+require_once SHIPRO_WC_PLUGIN_DIR . 'includes/class-shipro-wc-order-label.php';
 
 /**
  * Instancia todos los módulos del plugin.
@@ -26,6 +27,11 @@ function shipro_wc_bootstrap() {
 	//    - woocommerce_shipping_methods → filter para sumar 'shipro' al mapa.
 	add_action( 'woocommerce_shipping_init', 'shipro_wc_load_shipping_method' );
 	add_filter( 'woocommerce_shipping_methods', 'shipro_wc_register_shipping_method' );
+
+	// 3) Meta box "Envío Shipro" en la pantalla admin del pedido + AJAX para generar
+	//    la etiqueta (POST /envios), persistir el codigoServicio elegido en el checkout,
+	//    y guardar tracking + etiqueta + status en meta del pedido.
+	new Shipro_WC_Order_Label();
 }
 
 /**
