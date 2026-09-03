@@ -203,7 +203,7 @@ class Shipro_WC_Shipping_Method extends WC_Shipping_Method {
 		}
 
 		// 6) Endpoint — base URL filterable para poder apuntar a staging desde código.
-		$api_base = apply_filters( 'shipro_wc_api_base', 'https://api.shipro.pro/v1' );
+		$api_base = apply_filters( 'shipro_wc_api_base', 'https://pm.shipro.pro/api' );
 		$endpoint = trailingslashit( (string) $api_base ) . 'cotizar';
 
 		// 7) Fire. Timeout 5s = ventana dura del checkout (contrato DEUDA 129 / Camino 1).

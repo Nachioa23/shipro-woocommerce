@@ -144,21 +144,39 @@ class Shipro_WC_Order_Label {
 		$label        = (string) $order->get_meta( self::META_COURIER_LABEL );
 
 		// --- Caso A: ya se generó etiqueta ---
+		// STEP 3 Piece 2: mostrar de forma clara etiqueta + tracking + link a seguimiento.
+		// Todos los campos son defensivos: si falta un meta, esa línea simplemente se omite.
 		if ( '' !== $tracking ) {
-			echo '<p><strong>' . esc_html__( 'Tracking:', 'shipro-woocommerce' ) . '</strong><br />';
-			echo '<code>' . esc_html( $tracking ) . '</code></p>';
+			echo '<h4 style="margin:0 0 8px 0;">' . esc_html__( 'Etiqueta generada', 'shipro-woocommerce' ) . '</h4>';
+
+			echo '<p style="margin:0 0 6px 0;"><strong>' . esc_html__( 'Tracking:', 'shipro-woocommerce' ) . '</strong><br />';
+			echo '<code style="font-size:12px;">' . esc_html( $tracking ) . '</code></p>';
+
+			if ( '' !== $label ) {
+				echo '<p style="margin:0 0 6px 0;"><strong>' . esc_html__( 'Servicio:', 'shipro-woocommerce' ) . '</strong><br />' . esc_html( $label ) . '</p>';
+			}
 
 			if ( '' !== $etiqueta_url ) {
-				echo '<p><a href="' . esc_url( $etiqueta_url ) . '" target="_blank" rel="noopener noreferrer" class="button button-secondary">'
-					. esc_html__( 'Ver etiqueta (PDF)', 'shipro-woocommerce' )
+				echo '<p style="margin:8px 0;"><a href="' . esc_url( $etiqueta_url ) . '" target="_blank" rel="noopener noreferrer" class="button button-secondary">'
+					. esc_html__( 'Descargar etiqueta (PDF)', 'shipro-woocommerce' )
 					. '</a></p>';
 			}
 
 			if ( '' !== $status ) {
-				echo '<p><strong>' . esc_html__( 'Estado Shipro:', 'shipro-woocommerce' ) . '</strong> ' . esc_html( $status ) . '</p>';
+				echo '<p style="margin:0 0 6px 0;"><strong>' . esc_html__( 'Estado Shipro:', 'shipro-woocommerce' ) . '</strong> ' . esc_html( $status ) . '</p>';
 			}
 			if ( '' !== $motivo ) {
-				echo '<p><em>' . esc_html( $motivo ) . '</em></p>';
+				echo '<p style="margin:0 0 8px 0;"><em>' . esc_html( $motivo ) . '</em></p>';
+			}
+
+			// Link "Ver seguimiento" → apunta a la página del cliente (My Account > View Order)
+			// donde Piece 3 renderiza el rastreo público. Así el merchant ve LO MISMO que ve el
+			// comprador, sin duplicar UI ni inventar una URL alternativa.
+			$view_url = method_exists( $order, 'get_view_order_url' ) ? (string) $order->get_view_order_url() : '';
+			if ( '' !== $view_url ) {
+				echo '<p style="margin:8px 0 0 0;"><a href="' . esc_url( $view_url ) . '" target="_blank" rel="noopener noreferrer">'
+					. esc_html__( 'Ver seguimiento (lo que ve el comprador) ↗', 'shipro-woocommerce' )
+					. '</a></p>';
 			}
 			return;
 		}
@@ -269,7 +287,7 @@ class Shipro_WC_Order_Label {
 			$body = $this->armar_body( $order, $codigo_servicio );
 
 			// 6) POST /envios.
-			$api_base = apply_filters( 'shipro_wc_api_base', 'https://api.shipro.pro/v1' );
+			$api_base = apply_filters( 'shipro_wc_api_base', 'https://pm.shipro.pro/api' );
 			$endpoint = trailingslashit( (string) $api_base ) . 'envios';
 			$idem_key = 'wc-order-' . $order_id;
 

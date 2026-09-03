@@ -12,6 +12,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 require_once SHIPRO_WC_PLUGIN_DIR . 'includes/class-shipro-wc-settings.php';
 require_once SHIPRO_WC_PLUGIN_DIR . 'includes/class-shipro-wc-order-label.php';
+require_once SHIPRO_WC_PLUGIN_DIR . 'includes/class-shipro-wc-tracking-display.php';
 
 /**
  * Instancia todos los módulos del plugin.
@@ -32,6 +33,11 @@ function shipro_wc_bootstrap() {
 	//    la etiqueta (POST /envios), persistir el codigoServicio elegido en el checkout,
 	//    y guardar tracking + etiqueta + status en meta del pedido.
 	new Shipro_WC_Order_Label();
+
+	// 4) Rastreo público en la pantalla "My Account > Orders > View" del comprador.
+	//    Llama a GET /envios/rastreo-publico (endpoint PÚBLICO — sin API Key) y renderiza
+	//    estado + courier + línea de tiempo. Cache 5 min por tracking.
+	new Shipro_WC_Tracking_Display();
 }
 
 /**
