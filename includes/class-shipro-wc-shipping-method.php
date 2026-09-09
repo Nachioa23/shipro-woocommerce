@@ -207,16 +207,27 @@ class Shipro_WC_Shipping_Method extends WC_Shipping_Method {
 		$endpoint = trailingslashit( (string) $api_base ) . 'cotizar';
 
 		// 7) Fire. Timeout 5s = ventana dura del checkout (contrato DEUDA 129 / Camino 1).
+		// TEMPORAL (2026-09-04, validación e2e): timeout subido 5s→15s SOLO para confirmar
+		// que las tarifas aparecen en el checkout cuando Shipro responde. El valor CORRECTO
+		// de producción es 5s (ventana dura del checkout / Tiendanube). Revertir a 5 cuando
+		// la DEUDA 145 (núcleo) garantice respuesta <5s con tarifa de rescate. NO deployar a
+		// producción con 15s.
 		$response = wp_remote_post(
 			$endpoint,
 			array(
-				'timeout'  => 5,
+				'timeout'  => 15,
 				'blocking' => true,
 				'headers'  => array(
 					// La API Key NO debe aparecer en ningún log ni error message — sólo en el header.
 					'Authorization' => 'Bearer ' . $api_key,
-					'Content-Type'  => 'application/json',
+					'Content-Type'  => 'application/json; charset=utf-8',
 					'Accept'        => 'application/json',
+					// Defensivo: pedimos UTF-8 explícito para que el server devuelva
+					// chars acentuados (ej. "miércoles" en fechaEstimadaString) sin
+					// garble. Ver también el comentario en el bloque de parseo abajo:
+					// la fuente exacta del mojibake observado 2026-09-04 no está
+					// confirmada aún; este header es defensa no destructiva.
+					'Accept-Charset' => 'utf-8',
 				),
 				'body'     => wp_json_encode( $request ),
 			)
@@ -240,6 +251,12 @@ class Shipro_WC_Shipping_Method extends WC_Shipping_Method {
 		}
 
 		// 9) Parse. Un JSON malformado no debe explotar el checkout.
+		// UTF-8: wp_remote_retrieve_body devuelve los bytes crudos tal cual y
+		// json_decode los interpreta como UTF-8 nativo (comportamiento estándar).
+		// NO se aplica utf8_encode/utf8_decode/mb_convert_encoding acá — cualquier
+		// re-encode sobre una string ya-UTF-8 la corrompe (mojibake tipo "miÃ©rcoles").
+		// Si el mojibake se ve en el checkout, la causa probable está downstream (theme,
+		// template, storage de meta_data), NO en este parseo. Investigación pendiente.
 		$data = json_decode( $body, true );
 		if ( ! is_array( $data ) ) {
 			$this->debug_log( 'Shipro /cotizar body no es JSON válido.' );
@@ -289,12 +306,17 @@ class Shipro_WC_Shipping_Method extends WC_Shipping_Method {
 					$label = esc_html__( 'Shipro', 'shipro-woocommerce' );
 				}
 
-				// Rate id determinístico — permite que WC dedupe y que el comprador conserve la
-				// elección entre re-cálculos del carrito. Prefiere codigoServicio del server;
-				// si no viene, cae a un slug del courier+modalidad, y por último a un hash.
-				$rate_id_suffix = '' !== $codigo_servicio
-					? $codigo_servicio
-					: sanitize_key( strtolower( $courier . '-' . $modalidad ) );
+				// Rate id determinístico POR OPCIÓN. Clave: incluimos SIEMPRE el courier en
+				// el suffix porque codigoServicio del server NO es único cross-courier
+				// (ej. Mocis, Intralog y Andreani-domicilio comparten
+				// "entrega_domicilio_estandar"). Si el suffix fuera sólo codigoServicio,
+				// WC recibiría el mismo id repetido en add_rate() y sobrescribiría los
+				// rates previos → el checkout terminaría mostrando 0/1 opciones en vez de N
+				// (bug real observado 2026-09-04 con 3 opciones domicilio + 1 sucursal
+				// devueltas por /cotizar). Combinamos courier + (codigoServicio || modalidad):
+				// la tupla (courier, servicio/modalidad) es la clave natural de una opción.
+				$discriminador  = '' !== $codigo_servicio ? $codigo_servicio : $modalidad;
+				$rate_id_suffix = sanitize_key( strtolower( trim( $courier . '-' . $discriminador, '-' ) ) );
 				if ( '' === $rate_id_suffix ) {
 					$rate_id_suffix = 'opt-' . md5( (string) ( $opcion['id'] ?? $label ) );
 				}
@@ -312,6 +334,11 @@ class Shipro_WC_Shipping_Method extends WC_Shipping_Method {
 							'fechaEstimada'  => isset( $opcion['fechaEstimadaString'] ) ? (string) $opcion['fechaEstimadaString'] : '',
 							'esFallback'     => ! empty( $opcion['esFallback'] ),
 							'codigoServicio' => $codigo_servicio,
+							// El "courier" del server (ANDREANI/MOCI'S/INTRALOG/…) — se persiste
+							// después al meta del pedido (_shipro_nombre_courier) y viaja tal
+							// cual al POST /api/envios (`nombreCourier`). Núcleo normaliza,
+							// el plugin no mantiene mapeo. Sin transformar acá.
+							'courier'        => $courier,
 							'etiquetaSla'    => isset( $opcion['etiquetaSla'] ) ? (string) $opcion['etiquetaSla'] : '',
 							'slaHs'          => isset( $opcion['slaHs'] ) ? (int) $opcion['slaHs'] : 0,
 						),
