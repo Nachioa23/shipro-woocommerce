@@ -29,11 +29,13 @@ if ( ! defined( 'ABSPATH' ) ) {
 class Shipro_WC_Order_Label {
 
 	const META_CODIGO_SERVICIO = '_shipro_codigo_servicio';
+	const META_NOMBRE_COURIER  = '_shipro_nombre_courier'; // valor "courier" de /cotizar tal cual (server normaliza)
 	const META_COURIER_LABEL   = '_shipro_courier_label';
 	const META_TRACKING        = '_shipro_tracking';
 	const META_ETIQUETA_URL    = '_shipro_etiqueta_url';
 	const META_STATUS          = '_shipro_status';
 	const META_MOTIVO          = '_shipro_motivo_retencion';
+	const META_CORRECCION_TOKEN = '_shipro_correccion_token';
 
 	const AJAX_ACTION  = 'shipro_wc_generar_etiqueta';
 	const NONCE_ACTION = 'shipro_wc_generar_etiqueta';
@@ -80,6 +82,15 @@ class Shipro_WC_Order_Label {
 		$codigo = $item->get_meta( 'codigoServicio' );
 		if ( $codigo ) {
 			$order->update_meta_data( self::META_CODIGO_SERVICIO, sanitize_text_field( (string) $codigo ) );
+		}
+		// nombreCourier: el "courier" que devolvió /cotizar (ANDREANI / MOCI'S / …), tal
+		// cual. Núcleo (crear.ts) lo resuelve normalizando en ambos lados (case + acentos
+		// + apóstrofes) — el plugin NO mantiene mapeo. Sin este valor, POST /api/envios
+		// no puede desambiguar cuando varios couriers comparten codigoServicio
+		// ("entrega_domicilio_estandar" es común a Andreani/Mocis/Intralog).
+		$courier_meta = $item->get_meta( 'courier' );
+		if ( $courier_meta ) {
+			$order->update_meta_data( self::META_NOMBRE_COURIER, sanitize_text_field( (string) $courier_meta ) );
 		}
 		// Label humano ("ANDREANI - Entrega a Domicilio (Estándar)"). Útil para el meta box.
 		$label = method_exists( $item, 'get_name' ) ? (string) $item->get_name() : '';
@@ -142,6 +153,29 @@ class Shipro_WC_Order_Label {
 		$motivo       = (string) $order->get_meta( self::META_MOTIVO );
 		$codigo       = (string) $order->get_meta( self::META_CODIGO_SERVICIO );
 		$label        = (string) $order->get_meta( self::META_COURIER_LABEL );
+
+		// --- Caso RETENIDO: envío creado pero etiqueta pendiente por corrección de datos ---
+		// Va ANTES de Caso A porque para RETENIDO también persistimos tracking (el envío existe
+		// server-side), y no queremos que caiga en la rama "Etiqueta generada" — la etiqueta
+		// aún no existe. Muestra el estado con lo mínimo defensivo: tracking + motivo.
+		// Match case-insensitive porque el core emite ambos "RETENIDO"/"Retenido" (DEUDA 173).
+		if ( 'RETENIDO' === strtoupper( trim( $status ) ) ) {
+			echo '<h4 style="margin:0 0 8px 0;color:#b45309;">' . esc_html__( 'Retenido — corrección pendiente', 'shipro-woocommerce' ) . '</h4>';
+			if ( '' !== $tracking ) {
+				echo '<p style="margin:0 0 6px 0;"><strong>' . esc_html__( 'Tracking:', 'shipro-woocommerce' ) . '</strong><br />';
+				echo '<code style="font-size:12px;">' . esc_html( $tracking ) . '</code></p>';
+			}
+			if ( '' !== $label ) {
+				echo '<p style="margin:0 0 6px 0;"><strong>' . esc_html__( 'Servicio:', 'shipro-woocommerce' ) . '</strong><br />' . esc_html( $label ) . '</p>';
+			}
+			if ( '' !== $motivo ) {
+				echo '<p style="margin:0 0 6px 0;"><strong>' . esc_html__( 'Motivo:', 'shipro-woocommerce' ) . '</strong> ' . esc_html( $motivo ) . '</p>';
+			}
+			echo '<p style="margin:8px 0 0 0;font-size:12px;color:#78350f;">'
+				. esc_html__( 'La venta se registró. Cuando el comprador (o el operador) complete la corrección, la etiqueta se genera sola.', 'shipro-woocommerce' )
+				. '</p>';
+			return;
+		}
 
 		// --- Caso A: ya se generó etiqueta ---
 		// STEP 3 Piece 2: mostrar de forma clara etiqueta + tracking + link a seguimiento.
@@ -401,13 +435,25 @@ class Shipro_WC_Order_Label {
 			}
 		}
 
-		// Dims: se toman del PRIMER producto físico con dims cargadas — approximation.
-		// No inventamos. Si nada tiene dims, se omiten y el server decide (política).
+		// Dims — estrategia v1 (pragmática, NO es un motor de empaquetado):
+		// tomamos las dimensiones del producto físico MÁS GRANDE por VOLUMEN
+		// (largo × ancho × alto) del carrito. Requiere que las 3 dims sean > 0
+		// para computar volumen coherente — un producto con 1 sola dim cargada
+		// no entra (no hay caja real de la que hablar). Si nada califica, los
+		// 3 valores quedan en 0 y se OMITEN del body (el server aplica la
+		// política RETENIDO — "la venta se registra igual, la etiqueta espera
+		// hasta que el operador complete las dims"). NO inventamos 10×10×10.
+		//
+		// v1 explícita: bin-packing real / consolidación multi-bulto es concern
+		// del núcleo (DEUDA 103, molde ya existe en `lib/empaquetado/`). El
+		// plugin sólo transmite lo mejor que puede leer del carrito; la
+		// política de qué hacer con eso vive server-side.
 		$largo = 0.0;
 		$ancho = 0.0;
 		$alto  = 0.0;
+		$volumen_max = 0.0;
 		foreach ( $order->get_items() as $item ) {
-			if ( ! method_exists( $item, 'get_product' ) ) {
+			if ( ! $item || ! method_exists( $item, 'get_product' ) ) {
 				continue;
 			}
 			$product = $item->get_product();
@@ -417,16 +463,26 @@ class Shipro_WC_Order_Label {
 			$l = method_exists( $product, 'get_length' ) ? (float) $product->get_length() : 0.0;
 			$w = method_exists( $product, 'get_width' ) ? (float) $product->get_width() : 0.0;
 			$h = method_exists( $product, 'get_height' ) ? (float) $product->get_height() : 0.0;
-			if ( $l > 0 || $w > 0 || $h > 0 ) {
-				$largo = $l;
-				$ancho = $w;
-				$alto  = $h;
-				break;
+			if ( $l > 0 && $w > 0 && $h > 0 ) {
+				$vol = $l * $w * $h;
+				if ( $vol > $volumen_max ) {
+					$volumen_max = $vol;
+					$largo = $l;
+					$ancho = $w;
+					$alto  = $h;
+				}
 			}
 		}
 
 		$body = array(
 			'codigoServicio'     => $codigo_servicio,
+			// nombreCourier = valor "courier" que devolvió /cotizar (ANDREANI / MOCI'S / …),
+			// enviado TAL CUAL desde el meta del pedido — núcleo (crear.ts) resuelve
+			// normalizando en ambos lados. Sin este campo, crear.ts no puede desambiguar
+			// entre couriers que comparten codigoServicio y responde 400 COURIER_AUSENTE.
+			// Si el meta está vacío (orders viejas pre-fix), viaja "" y el server manda
+			// el error de negocio esperado — no explota nada acá.
+			'nombreCourier'      => (string) $order->get_meta( self::META_NOMBRE_COURIER ),
 			'destinatarioNombre' => $nombre,
 			'cpDestino'          => (string) $order->get_shipping_postcode(),
 			'provinciaDestino'   => (string) $order->get_shipping_state(),
@@ -472,10 +528,25 @@ class Shipro_WC_Order_Label {
 	 * @return void  (envía la respuesta JSON al cliente, no retorna).
 	 */
 	private function procesar_respuesta_ok( \WC_Order $order, array $data ) {
-		$status   = isset( $data['status'] ) ? (string) $data['status'] : '';
+		// Field robustness: el core /api/envios devuelve el estado del envío en
+		// `estado` (camino feliz) o `estadoActual` (replay idempotente). La versión
+		// vieja del contrato v1.1 usaba `status` — se mantiene como fallback legacy.
+		// Ver DEUDA 173 (core team, 2026-09-09): los estados son strings libres
+		// sin enum centralizada; el core prometió normalizar a un enum más
+		// adelante y avisarnos antes. Mientras tanto, leer con la prioridad
+		// estado > estadoActual > status cubre todos los paths actuales.
+		$status = '';
+		if ( isset( $data['estado'] ) ) {
+			$status = (string) $data['estado'];
+		} elseif ( isset( $data['estadoActual'] ) ) {
+			$status = (string) $data['estadoActual'];
+		} elseif ( isset( $data['status'] ) ) {
+			$status = (string) $data['status'];
+		}
 		$tracking = isset( $data['tracking'] ) ? (string) $data['tracking'] : '';
 		$et_url   = isset( $data['etiquetaUrl'] ) ? (string) $data['etiquetaUrl'] : '';
 		$motivo   = isset( $data['motivoRetencion'] ) ? (string) $data['motivoRetencion'] : '';
+		$correccion_token = isset( $data['correccionToken'] ) ? (string) $data['correccionToken'] : '';
 		$replayed = ! empty( $data['replayed'] );
 
 		// Persistimos SIEMPRE lo que el server informó, para el meta box y auditoría.
@@ -491,74 +562,120 @@ class Shipro_WC_Order_Label {
 		if ( '' !== $motivo ) {
 			$order->update_meta_data( self::META_MOTIVO, sanitize_text_field( $motivo ) );
 		}
+		if ( '' !== $correccion_token ) {
+			$order->update_meta_data( self::META_CORRECCION_TOKEN, sanitize_text_field( $correccion_token ) );
+		}
 		$order->save();
 
 		// Mensaje al merchant en la UI + order note.
-		switch ( $status ) {
-			case 'CREADO':
-				$msg = $replayed
-					? esc_html__( 'Etiqueta ya generada previamente (idempotente).', 'shipro-woocommerce' )
-					: esc_html__( 'Etiqueta Shipro generada correctamente.', 'shipro-woocommerce' );
-				$order->add_order_note( sprintf(
-					/* translators: %s = tracking number */
-					esc_html__( 'Etiqueta Shipro generada. Tracking: %s', 'shipro-woocommerce' ),
-					$tracking
-				) );
-				wp_send_json_success( array( 'message' => $msg, 'tracking' => $tracking, 'etiquetaUrl' => $et_url ) );
-				return;
+		// Normalized copy for case-insensitive comparison. NO tocamos el $status
+		// crudo — se persiste tal cual vino del server (audit trail honesto) y se
+		// muestra tal cual en el meta box. La normalización es SOLO para el
+		// matching acá, porque los literales del core son strings libres con
+		// casing inconsistente ("Pendiente"/"PENDIENTE", "Retenido"/"RETENIDO").
+		// Cuando el core normalize a un enum (DEUDA 173), esta lógica seguirá
+		// funcionando byte-idéntica.
+		$s = strtoupper( trim( $status ) );
 
-			case 'BLOQUEADO_DATOS_PAQUETE':
-				$order->add_order_note( esc_html__( 'Shipro rechazó: faltan datos del paquete (peso o dimensiones).', 'shipro-woocommerce' ) );
-				$msg = esc_html__( 'Faltan datos del paquete (peso o dimensiones). Completalos en los productos y reintentá.', 'shipro-woocommerce' );
-				if ( '' !== $motivo ) {
-					$msg .= ' — ' . esc_html( $motivo );
-				}
-				wp_send_json_error( array( 'message' => $msg ) );
-				return;
-
-			case 'RETENIDO':
-				$order->add_order_note( esc_html__( 'Shipro RETENIDO (dirección u otro dato del comprador).', 'shipro-woocommerce' ) );
-				$msg = esc_html__( 'El envío quedó RETENIDO por Shipro.', 'shipro-woocommerce' );
-				if ( '' !== $motivo ) {
-					$msg .= ' — ' . esc_html( $motivo );
-				}
-				wp_send_json_error( array( 'message' => $msg ) );
-				return;
-
-			case 'BLOQUEADO_SALDO':
-				$order->add_order_note( esc_html__( 'Shipro BLOQUEADO_SALDO: saldo insuficiente.', 'shipro-woocommerce' ) );
-				wp_send_json_error( array( 'message' => esc_html__( 'Saldo insuficiente en Shipro para generar la etiqueta.', 'shipro-woocommerce' ) ) );
-				return;
-
-			case 'BLOQUEADO_CREDENCIAL':
-				$order->add_order_note( esc_html__( 'Shipro BLOQUEADO_CREDENCIAL: credencial de courier no configurada.', 'shipro-woocommerce' ) );
-				wp_send_json_error( array( 'message' => esc_html__( 'Falta credencial del courier en Shipro para este servicio.', 'shipro-woocommerce' ) ) );
-				return;
-
-			case 'BLOQUEADO_OPERATIVIDAD':
-				$order->add_order_note( esc_html__( 'Shipro BLOQUEADO_OPERATIVIDAD: par depósito×courier no operativo.', 'shipro-woocommerce' ) );
-				wp_send_json_error( array( 'message' => esc_html__( 'El par depósito × courier no está configurado como operativo en Shipro.', 'shipro-woocommerce' ) ) );
-				return;
-
-			case 'BLOQUEADO_DEPOSITO':
-				$order->add_order_note( esc_html__( 'Shipro BLOQUEADO_DEPOSITO: sin depósito predeterminado.', 'shipro-woocommerce' ) );
-				wp_send_json_error( array( 'message' => esc_html__( 'Configurá un depósito predeterminado en Shipro para poder despachar.', 'shipro-woocommerce' ) ) );
-				return;
-
-			default:
-				// Status desconocido → tratamos como error suave; ya persistimos el status crudo arriba.
-				$order->add_order_note( sprintf(
-					/* translators: %s = status string from Shipro */
-					esc_html__( 'Respuesta Shipro con status desconocido: %s', 'shipro-woocommerce' ),
-					$status
-				) );
-				wp_send_json_error( array( 'message' => sprintf(
-					/* translators: %s = status string */
-					esc_html__( 'Shipro respondió con status desconocido: %s', 'shipro-woocommerce' ),
-					$status
-				) ) );
-				return;
+		// SUCCESS group — etiqueta creada, mostrar tracking + link + PDF.
+		// "PENDIENTE" es el canónico del core; "IMPRESO" es schema-default y también
+		// aparece en inversa/rows históricos; "CREADO" es legacy del contrato v1.1
+		// (el core nunca lo emite hoy, pero se mantiene por si el contrato se cierra).
+		if ( in_array( $s, array( 'PENDIENTE', 'IMPRESO', 'CREADO' ), true ) ) {
+			$msg = $replayed
+				? esc_html__( 'Etiqueta ya generada previamente (idempotente).', 'shipro-woocommerce' )
+				: esc_html__( 'Etiqueta Shipro generada correctamente.', 'shipro-woocommerce' );
+			$order->add_order_note( sprintf(
+				/* translators: %s = tracking number */
+				esc_html__( 'Etiqueta Shipro generada. Tracking: %s', 'shipro-woocommerce' ),
+				$tracking
+			) );
+			wp_send_json_success( array( 'message' => $msg, 'tracking' => $tracking, 'etiquetaUrl' => $et_url ) );
+			return;
 		}
+
+		// RETENIDO — envío creado (con tracking) pero etiqueta pendiente de
+		// corrección del comprador. NO es error: la venta se registra igual.
+		if ( 'RETENIDO' === $s ) {
+			$nota = '' !== $motivo
+				? sprintf(
+					/* translators: %s = motivo de retención */
+					esc_html__( 'Envío creado pero RETENIDO pendiente de corrección de datos (%s).', 'shipro-woocommerce' ),
+					$motivo
+				)
+				: esc_html__( 'Envío creado pero RETENIDO pendiente de corrección de datos.', 'shipro-woocommerce' );
+			$order->add_order_note( $nota );
+
+			$motivo_txt = '' !== $motivo ? $motivo : esc_html__( 'sin detalle', 'shipro-woocommerce' );
+			$msg = sprintf(
+				/* translators: %s = motivo de retención en castellano */
+				esc_html__( 'Envío creado pero RETENIDO: faltan datos para generar la etiqueta (%s). Se completa con una corrección y la etiqueta se genera sola.', 'shipro-woocommerce' ),
+				$motivo_txt
+			);
+			// TODO(shipro): cuando el server exponga una URL de corrección construible
+			// desde correccionToken + tracking, surfacearla acá como link accionable.
+			// Por ahora NO se hardcodea ninguna URL adivinada — mostramos mensaje +
+			// tracking + motivo y dejamos el link como follow-up.
+			wp_send_json_success( array(
+				'message'  => $msg,
+				'tracking' => $tracking,
+				'status'   => 'RETENIDO',
+			) );
+			return;
+		}
+
+		// BLOQUEADO_* — el envío se creó pero no se despachó, cada motivo tiene
+		// su mensaje específico. Todos wp_send_json_error para que el JS del
+		// meta box re-habilite el botón y muestre la razón.
+		if ( 'BLOQUEADO_SALDO' === $s ) {
+			$order->add_order_note( esc_html__( 'Shipro BLOQUEADO_SALDO: saldo insuficiente.', 'shipro-woocommerce' ) );
+			wp_send_json_error( array( 'message' => esc_html__( 'Saldo insuficiente en Shipro para generar la etiqueta.', 'shipro-woocommerce' ) ) );
+			return;
+		}
+		if ( 'BLOQUEADO_CREDENCIAL' === $s ) {
+			$order->add_order_note( esc_html__( 'Shipro BLOQUEADO_CREDENCIAL: credencial de courier no configurada.', 'shipro-woocommerce' ) );
+			wp_send_json_error( array( 'message' => esc_html__( 'Falta credencial del courier en Shipro para este servicio.', 'shipro-woocommerce' ) ) );
+			return;
+		}
+		if ( 'BLOQUEADO_OPERATIVIDAD' === $s ) {
+			$order->add_order_note( esc_html__( 'Shipro BLOQUEADO_OPERATIVIDAD: par depósito×courier no operativo.', 'shipro-woocommerce' ) );
+			wp_send_json_error( array( 'message' => esc_html__( 'El par depósito × courier no está configurado como operativo en Shipro.', 'shipro-woocommerce' ) ) );
+			return;
+		}
+		if ( 'BLOQUEADO_DEPOSITO' === $s ) {
+			$order->add_order_note( esc_html__( 'Shipro BLOQUEADO_DEPOSITO: sin depósito predeterminado.', 'shipro-woocommerce' ) );
+			wp_send_json_error( array( 'message' => esc_html__( 'Configurá un depósito predeterminado en Shipro para poder despachar.', 'shipro-woocommerce' ) ) );
+			return;
+		}
+		if ( 'BLOQUEADO_DATOS_PAQUETE' === $s ) {
+			$order->add_order_note( esc_html__( 'Shipro rechazó: faltan datos del paquete (peso o dimensiones).', 'shipro-woocommerce' ) );
+			$msg = esc_html__( 'Faltan datos del paquete (peso o dimensiones). Completalos en los productos y reintentá.', 'shipro-woocommerce' );
+			if ( '' !== $motivo ) {
+				$msg .= ' — ' . esc_html( $motivo );
+			}
+			wp_send_json_error( array( 'message' => $msg ) );
+			return;
+		}
+		if ( 'BLOQUEADO_PARCIAL' === $s ) {
+			$order->add_order_note( esc_html__( 'Shipro BLOQUEADO_PARCIAL: multi-tramo con al menos un tramo fallado.', 'shipro-woocommerce' ) );
+			wp_send_json_error( array( 'message' => esc_html__( 'El envío se creó parcialmente (multi-tramo con un fallo). Revisá en Shipro.', 'shipro-woocommerce' ) ) );
+			return;
+		}
+
+		// Status desconocido → error suave. Debería ser RARO ahora que cubrimos
+		// SUCCESS + RETENIDO + los 6 BLOQUEADO_*. Cae acá solo si el core emite
+		// un estado nuevo que no está en la lista canónica (aviso: DEUDA 173 —
+		// el core promete avisar antes de agregar estados nuevos).
+		$order->add_order_note( sprintf(
+			/* translators: %s = status string from Shipro */
+			esc_html__( 'Respuesta Shipro con status desconocido: %s', 'shipro-woocommerce' ),
+			$status
+		) );
+		wp_send_json_error( array( 'message' => sprintf(
+			/* translators: %s = status string */
+			esc_html__( 'Shipro respondió con status desconocido: %s', 'shipro-woocommerce' ),
+			$status
+		) ) );
 	}
 
 	/**
