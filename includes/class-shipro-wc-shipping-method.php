@@ -206,16 +206,16 @@ class Shipro_WC_Shipping_Method extends WC_Shipping_Method {
 		$api_base = apply_filters( 'shipro_wc_api_base', 'https://pm.shipro.pro/api' );
 		$endpoint = trailingslashit( (string) $api_base ) . 'cotizar';
 
-		// 7) Fire. Timeout 5s = ventana dura del checkout (contrato DEUDA 129 / Camino 1).
-		// TEMPORAL (2026-09-04, validación e2e): timeout subido 5s→15s SOLO para confirmar
-		// que las tarifas aparecen en el checkout cuando Shipro responde. El valor CORRECTO
-		// de producción es 5s (ventana dura del checkout / Tiendanube). Revertir a 5 cuando
-		// la DEUDA 145 (núcleo) garantice respuesta <5s con tarifa de rescate. NO deployar a
-		// producción con 15s.
+		// 7) Fire. Timeout de cotización: 10s. Es el valor de producción (NO temporal).
+		// Shipro cotiza con techo de 8s (DEUDA 145: cotizador paralelizado en A + timeout
+		// por courier en B); 10s = techo 8s + margen, y es el límite que toleran las
+		// plataformas (Tiendanube 10s). NO bajar a 5s: cortaría couriers que legítimamente
+		// tardan 5-8s cayendo a tarifa de rescate. Si entra Shopify alto volumen (~3s) al
+		// roadmap, se reevalúa por plataforma.
 		$response = wp_remote_post(
 			$endpoint,
 			array(
-				'timeout'  => 15,
+				'timeout'  => 10,
 				'blocking' => true,
 				'headers'  => array(
 					// La API Key NO debe aparecer en ningún log ni error message — sólo en el header.
