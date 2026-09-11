@@ -154,6 +154,31 @@ class Shipro_WC_Order_Label {
 		$codigo       = (string) $order->get_meta( self::META_CODIGO_SERVICIO );
 		$label        = (string) $order->get_meta( self::META_COURIER_LABEL );
 
+		// --- Caso REINTENTANDO: reintento auto del despacho, transient, sin acción del merchant ---
+		// PREPARADO ANTES DEL DEPLOY DEL CORE (Sub-fase 3 DEUDA 178). Estado transient
+		// que dura segundos: el core reintenta el dispatch al courier y transiciona a
+		// Pendiente (éxito) o BLOQUEADO_PARCIAL (agotó intentos). Va ANTES de Caso A por
+		// la misma razón que RETENIDO: el envío existe con tracking pero la etiqueta aún
+		// no. Diferencia clave con RETENIDO: NO pide acción del comprador — se resuelve
+		// solo. Si el core nunca emite este estado, la rama simplemente nunca se ejecuta.
+		if ( 'REINTENTANDO' === strtoupper( trim( $status ) ) ) {
+			echo '<h4 style="margin:0 0 8px 0;color:#1d4ed8;">' . esc_html__( 'Reintentando despacho — en curso', 'shipro-woocommerce' ) . '</h4>';
+			if ( '' !== $tracking ) {
+				echo '<p style="margin:0 0 6px 0;"><strong>' . esc_html__( 'Tracking:', 'shipro-woocommerce' ) . '</strong><br />';
+				echo '<code style="font-size:12px;">' . esc_html( $tracking ) . '</code></p>';
+			}
+			if ( '' !== $label ) {
+				echo '<p style="margin:0 0 6px 0;"><strong>' . esc_html__( 'Servicio:', 'shipro-woocommerce' ) . '</strong><br />' . esc_html( $label ) . '</p>';
+			}
+			if ( '' !== $motivo ) {
+				echo '<p style="margin:0 0 6px 0;"><strong>' . esc_html__( 'Detalle:', 'shipro-woocommerce' ) . '</strong> ' . esc_html( $motivo ) . '</p>';
+			}
+			echo '<p style="margin:8px 0 0 0;font-size:12px;color:#1e3a8a;">'
+				. esc_html__( 'La venta está registrada. El sistema está reintentando el despacho al courier — se resuelve solo en unos segundos. Refrescá esta pantalla para ver el resultado. No hace falta acción del comprador.', 'shipro-woocommerce' )
+				. '</p>';
+			return;
+		}
+
 		// --- Caso RETENIDO: envío creado pero etiqueta pendiente por corrección de datos ---
 		// Va ANTES de Caso A porque para RETENIDO también persistimos tracking (el envío existe
 		// server-side), y no queremos que caiga en la rama "Etiqueta generada" — la etiqueta
@@ -620,6 +645,36 @@ class Shipro_WC_Order_Label {
 				'message'  => $msg,
 				'tracking' => $tracking,
 				'status'   => 'RETENIDO',
+			) );
+			return;
+		}
+
+		// REINTENTANDO — estado transient del core mientras reintenta despachar al
+		// courier (Sub-fase 3 de DEUDA 178 del core; agregado acá PROACTIVAMENTE
+		// antes del deploy del core para evitar caer en "status desconocido").
+		// Es un WAIT sin acción del comprador (a diferencia de RETENIDO): el
+		// sistema reintenta solo por unos segundos y transiciona a Pendiente si
+		// el retry tiene éxito, o a BLOQUEADO_PARCIAL si se agotan los intentos.
+		// wp_send_json_success para que el UI NO lo muestre como error. Si el
+		// core nunca emite este estado, esta rama simplemente nunca se ejecuta.
+		if ( 'REINTENTANDO' === $s ) {
+			$nota = '' !== $motivo
+				? sprintf(
+					/* translators: %s = detalle del reintento */
+					esc_html__( 'Envío en REINTENTANDO: el sistema reintenta el despacho al courier (%s).', 'shipro-woocommerce' ),
+					$motivo
+				)
+				: esc_html__( 'Envío en REINTENTANDO: el sistema reintenta el despacho al courier.', 'shipro-woocommerce' );
+			$order->add_order_note( $nota );
+
+			$msg = esc_html__(
+				'El envío se está reprocesando (reintentando el despacho al courier). Aguardá unos segundos y refrescá — la etiqueta se genera sola si el reintento tiene éxito.',
+				'shipro-woocommerce'
+			);
+			wp_send_json_success( array(
+				'message'  => $msg,
+				'tracking' => $tracking,
+				'status'   => 'REINTENTANDO',
 			) );
 			return;
 		}
